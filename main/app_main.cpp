@@ -10,6 +10,18 @@
 #include <esp_log.h>
 #include <nvs_flash.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+
+#define EXAMPLE_IR_RESOLUTION_HZ     1000000 // 1MHz resolution, 1 tick = 1us
+#define EXAMPLE_IR_TX_GPIO_NUM       5
+
+#include "driver/rmt_tx.h"
+#include "driver/rmt_rx.h"
+#include "ir_nec_encoder.h"
+#include "ir_sharpac_encoder.h"
+
 #include <esp_matter.h>
 #include <esp_matter_console.h>
 #include <esp_matter_ota.h>
@@ -40,6 +52,13 @@ extern const char decryption_key_end[] asm("_binary_esp_image_encryption_key_pem
 static const char *s_decryption_key = decryption_key_start;
 static const uint16_t s_decryption_key_len = decryption_key_end - decryption_key_start;
 #endif // CONFIG_ENABLE_ENCRYPTED_OTA
+
+rmt_tx_channel_config_t tx_channel_cfg;
+rmt_channel_handle_t tx_channel;
+rmt_carrier_config_t carrier_cfg;
+rmt_transmit_config_t transmit_config;
+
+rmt_encoder_handle_t nec_encoder;
 
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
@@ -125,11 +144,49 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
     if (type == PRE_UPDATE) {
         /* Driver update */
-        app_driver_handle_t driver_handle = (app_driver_handle_t)priv_data;
-        err = app_driver_attribute_update(driver_handle, endpoint_id, cluster_id, attribute_id, val);
+        // app_driver_handle_t driver_handle = (app_driver_handle_t)priv_data;
+        // err = app_driver_attribute_update(driver_handle, endpoint_id, cluster_id, attribute_id, val);
+      if (cluster_id == OnOff::Id){
+        if (attribute_id == OnOff::Attributes::OnOff::Id){
+          bool new_onoff_state = val->val.b;
+
+          const ir_nec_scan_code_t scan_code = {
+              .address = 0x6d82,
+              .command = 0x40bf,
+          };
+          ESP_LOGI(TAG, "sending light IR");
+          ESP_ERROR_CHECK(rmt_transmit(tx_channel, nec_encoder, &scan_code, sizeof(scan_code), &transmit_config));
+        }
+      }
     }
 
     return err;
+}
+
+void init_ir(){
+  tx_channel_cfg = {
+                    .gpio_num = EXAMPLE_IR_TX_GPIO_NUM,
+                    .clk_src = RMT_CLK_SRC_DEFAULT,
+                    .resolution_hz = EXAMPLE_IR_RESOLUTION_HZ,
+                    .mem_block_symbols = 64, // amount of RMT symbols that the channel can store at Ca time
+                    .trans_queue_depth = 4,  // number of transactions that allowed to pending in the background, this example won't queue multiple transactions, so queue depth > 1 is sufficient
+  };
+  tx_channel = NULL;
+  ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_channel_cfg, &tx_channel));
+  carrier_cfg = {
+                 .frequency_hz = 38000, // 38KHz
+                 .duty_cycle = 0.50,
+  };
+  ESP_ERROR_CHECK(rmt_apply_carrier(tx_channel, &carrier_cfg));
+  transmit_config = {
+                     .loop_count = 0, // no loop
+  };
+  ir_nec_encoder_config_t nec_encoder_cfg = {
+                                             .resolution = EXAMPLE_IR_RESOLUTION_HZ,
+  };
+  nec_encoder = NULL;
+  ESP_ERROR_CHECK(rmt_new_ir_nec_encoder(&nec_encoder_cfg, &nec_encoder));
+  ESP_ERROR_CHECK(rmt_enable(tx_channel));
 }
 
 extern "C" void app_main()
@@ -139,26 +196,33 @@ extern "C" void app_main()
     /* Initialize the ESP NVS layer */
     nvs_flash_init();
 
+    /* initialize IR */
+    init_ir();
+
     /* Initialize driver */
-    app_driver_handle_t light_handle = app_driver_light_init();
-    app_driver_handle_t button_handle = app_driver_button_init();
-    app_reset_button_register(button_handle);
+    // app_driver_handle_t light_handle = app_driver_light_init();
+    // app_driver_handle_t button_handle = app_driver_button_init();
+    // app_reset_button_register(button_handle);
 
     /* Create a Matter node and add the mandatory Root Node device type on endpoint 0 */
     node::config_t node_config;
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
 
-    extended_color_light::config_t light_config;
-    light_config.on_off.on_off = DEFAULT_POWER;
-    light_config.on_off.lighting.start_up_on_off = nullptr;
-    light_config.level_control.current_level = DEFAULT_BRIGHTNESS;
-    light_config.level_control.lighting.start_up_current_level = DEFAULT_BRIGHTNESS;
-    light_config.color_control.color_mode = EMBER_ZCL_COLOR_MODE_COLOR_TEMPERATURE;
-    light_config.color_control.enhanced_color_mode = EMBER_ZCL_COLOR_MODE_COLOR_TEMPERATURE;
-    light_config.color_control.color_temperature.startup_color_temperature_mireds = nullptr;
-    endpoint_t *endpoint = extended_color_light::create(node, &light_config, ENDPOINT_FLAG_NONE, light_handle);
+    // extended_color_light::config_t light_config;
+    // light_config.on_off.on_off = DEFAULT_POWER;
+    // light_config.on_off.lighting.start_up_on_off = nullptr;
+    // light_config.level_control.current_level = DEFAULT_BRIGHTNESS;
+    // light_config.level_control.lighting.start_up_current_level = DEFAULT_BRIGHTNESS;
+    // light_config.color_control.color_mode = EMBER_ZCL_COLOR_MODE_COLOR_TEMPERATURE;
+    // light_config.color_control.enhanced_color_mode = EMBER_ZCL_COLOR_MODE_COLOR_TEMPERATURE;
+    // light_config.color_control.color_temperature.startup_color_temperature_mireds = nullptr;
+    // endpoint_t *endpoint = extended_color_light::create(node, &light_config, ENDPOINT_FLAG_NONE, light_handle);
+    on_off_plugin_unit::config_t onoff_light_config;
+    onoff_light_config.on_off.on_off = false;
+    onoff_light_config.on_off.lighting.start_up_on_off = false;
+    endpoint_t *endpoint = on_off_plugin_unit::create(node, &onoff_light_config, ENDPOINT_FLAG_NONE, NULL);
 
-    /* These node and endpoint handles can be used to create/add other endpoints and clusters. */
+    /* these node and endpoint handles can be used to create/add other endpoints and clusters. */
     if (!node || !endpoint) {
         ESP_LOGE(TAG, "Matter node creation failed");
     }
@@ -197,4 +261,15 @@ extern "C" void app_main()
     esp_matter::console::wifi_register_commands();
     esp_matter::console::init();
 #endif
+
+    // ----- IR ----- //
+     const ir_nec_scan_code_t scan_code = {
+                                          .address = 0x6d82,
+                                          .command = 0x40bf,
+    };
+    ESP_ERROR_CHECK(rmt_transmit(tx_channel, nec_encoder, &scan_code, sizeof(scan_code), &transmit_config));
+    //ESP_ERROR_CHECK(rmt_transmit(rx_channel, ));
+    // light onoff
+    // .address = 0xd729
+    // .command = 0x04fb
 }
