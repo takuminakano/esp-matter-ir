@@ -59,6 +59,14 @@ rmt_carrier_config_t carrier_cfg;
 rmt_transmit_config_t transmit_config;
 
 rmt_encoder_handle_t nec_encoder;
+rmt_encoder_handle_t sharpac_encoder;
+
+#define MATTER_AC_TYPE_POWER_OFF 0
+#define MATTER_AC_TYPE_COOLING 3
+#define MATTER_AC_TYPE_HEATING 4
+
+int16_t currentTargetTemp = 26;
+uint8_t currentTypeInfo = MATTER_AC_TYPE_POWER_OFF;
 
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
@@ -137,6 +145,34 @@ static esp_err_t app_identification_cb(identification::callback_type_t type, uin
     return ESP_OK;
 }
 
+static esp_err_t rmt_transmit_sharpac(int16_t targetTemp, uint8_t typeInfo){
+  uint8_t sharp_scan_code[13] = {0xAA, 0x5A, 0xCF, 0x10, 0x0A, 0x21, 0x22, 0x00, 0x08, 0xA0, 0x00, 0xE4, 0xD1};
+  if (typeInfo == MATTER_AC_TYPE_POWER_OFF){
+    ESP_ERROR_CHECK(rmt_transmit(tx_channel, sharpac_encoder, sharp_scan_code, sizeof(sharp_scan_code), &transmit_config));
+    ESP_LOGI(TAG, "power off");
+    return ESP_OK;
+  }
+  if (typeInfo == MATTER_AC_TYPE_COOLING){
+    sharp_scan_code[5] = 0x11;
+    ESP_LOGI(TAG, "cooling");
+    //sharp_scan_code[6] = 0x22;
+  } else if (typeInfo == MATTER_AC_TYPE_HEATING){
+    ESP_LOGI(TAG, "heating");
+    sharp_scan_code[5] = 0x11;
+    sharp_scan_code[6] = 0x21;
+  }
+  int8_t tempInDegree = targetTemp/100;
+  ESP_LOGI(TAG, "temp: %i", tempInDegree);
+  sharp_scan_code[4] = tempInDegree - 17;
+  uint8_t checkSum = 0x00;
+  for(uint8_t index=0; index<11; index++){
+    checkSum ^= sharp_scan_code[index];
+  }
+  sharp_scan_code[12] = ((checkSum << 4) & 0xF0) | 0x01;
+  ESP_ERROR_CHECK(rmt_transmit(tx_channel, sharpac_encoder, sharp_scan_code, sizeof(sharp_scan_code), &transmit_config));
+  return ESP_OK;
+}
+
 static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16_t endpoint_id, uint32_t cluster_id,
                                          uint32_t attribute_id, esp_matter_attr_val_t *val, void *priv_data)
 {
@@ -157,6 +193,26 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
           ESP_LOGI(TAG, "sending light IR");
           ESP_ERROR_CHECK(rmt_transmit(tx_channel, nec_encoder, &scan_code, sizeof(scan_code), &transmit_config));
         }
+      } else if (cluster_id == Thermostat::Id){
+        if (attribute_id == Thermostat::Attributes::OccupiedCoolingSetpoint::Id || attribute_id == Thermostat::Attributes::OccupiedHeatingSetpoint::Id){
+          int16_t targetTemp = val->val.i16;
+          // uint8_t sharp_scan_code[13] = {0xAA, 0x5A, 0xCF, 0x10, 0x0A, 0x21, 0x22, 0x00, 0x08, 0xA0, 0x00, 0xE4, 0xD1};
+          // // TODO: encode system mode, temp
+
+          // ESP_ERROR_CHECK(rmt_transmit(tx_channel, sharpac_encoder, sharp_scan_code, sizeof(sharp_scan_code), &transmit_config));
+          // 2800 -> 28.00 degree
+          currentTargetTemp = targetTemp;
+          ESP_LOGI(TAG, "updating target temperature");
+          ESP_ERROR_CHECK(rmt_transmit_sharpac(currentTargetTemp, currentTypeInfo));
+        } else if (attribute_id == Thermostat::Attributes::SystemMode::Id){
+          uint8_t typeInfo = val->val.u8;
+          currentTypeInfo = typeInfo;
+          ESP_LOGI(TAG, "updating type info");
+          ESP_ERROR_CHECK(rmt_transmit_sharpac(currentTargetTemp, currentTypeInfo));
+          // uint8_t sharp_scan_code[13] = {0xAA, 0x5A, 0xCF, 0x10, 0x0A, 0x21, 0x22, 0x00, 0x08, 0xA0, 0x00, 0xE4, 0xD1};
+          // // TODO: encode system mode, temp
+          // ESP_ERROR_CHECK(rmt_transmit(tx_channel, sharpac_encoder, sharp_scan_code, sizeof(sharp_scan_code), &transmit_config));
+        }
       }
     }
 
@@ -168,7 +224,7 @@ void init_ir(){
                     .gpio_num = EXAMPLE_IR_TX_GPIO_NUM,
                     .clk_src = RMT_CLK_SRC_DEFAULT,
                     .resolution_hz = EXAMPLE_IR_RESOLUTION_HZ,
-                    .mem_block_symbols = 64, // amount of RMT symbols that the channel can store at Ca time
+                    .mem_block_symbols = 128, // amount of RMT symbols that the channel can store at Ca time
                     .trans_queue_depth = 4,  // number of transactions that allowed to pending in the background, this example won't queue multiple transactions, so queue depth > 1 is sufficient
   };
   tx_channel = NULL;
@@ -184,8 +240,13 @@ void init_ir(){
   ir_nec_encoder_config_t nec_encoder_cfg = {
                                              .resolution = EXAMPLE_IR_RESOLUTION_HZ,
   };
+  ir_sharpac_encoder_config_t sharpac_encoder_cfg = {
+                                                     .resolution = EXAMPLE_IR_RESOLUTION_HZ,
+  };
   nec_encoder = NULL;
   ESP_ERROR_CHECK(rmt_new_ir_nec_encoder(&nec_encoder_cfg, &nec_encoder));
+  sharpac_encoder = NULL;
+  ESP_ERROR_CHECK(rmt_new_ir_sharpac_encoder(&sharpac_encoder_cfg, &sharpac_encoder));
   ESP_ERROR_CHECK(rmt_enable(tx_channel));
 }
 
@@ -195,6 +256,7 @@ extern "C" void app_main()
 
     /* Initialize the ESP NVS layer */
     nvs_flash_init();
+    //nvs_flash_erase();
 
     /* initialize IR */
     init_ir();
@@ -221,6 +283,30 @@ extern "C" void app_main()
     onoff_light_config.on_off.on_off = false;
     onoff_light_config.on_off.lighting.start_up_on_off = false;
     endpoint_t *endpoint = on_off_plugin_unit::create(node, &onoff_light_config, ENDPOINT_FLAG_NONE, NULL);
+
+    /* thermostat */
+    thermostat::config thermostat_config;
+    thermostat_config.thermostat.local_temperature = 24;
+    endpoint_t *endpoint_2 = thermostat::create(node, &thermostat_config,
+                                                        ENDPOINT_FLAG_NONE, NULL);
+    cluster_t *thermostat_cluster = cluster::get(endpoint_2, Thermostat::Id);
+    cluster::thermostat::feature::heating::config_t heating_config;
+    heating_config.abs_max_heat_setpoint_limit = 3000; // 30 degree
+    heating_config.abs_min_heat_setpoint_limit = 1500;
+    heating_config.max_heat_setpoint_limit = 2800;
+    heating_config.min_heat_setpoint_limit = 2000;
+    heating_config.occupied_heating_setpoint = 2300;
+    heating_config.pi_heating_demand = 0;
+    cluster::thermostat::feature::heating::add(thermostat_cluster, &heating_config);
+
+    cluster::thermostat::feature::cooling::config_t cooling_config;
+    cooling_config.abs_max_cool_setpoint_limit = 3200;
+    cooling_config.abs_min_cool_setpoint_limit = 1500;
+    cooling_config.max_cool_setpoint_limit = 3000;
+    cooling_config.min_cool_setpoint_limit = 1700;
+    cooling_config.occupied_cooling_setpoint = 2800;
+    cooling_config.pi_cooling_demand = 0;
+    cluster::thermostat::feature::cooling::add(thermostat_cluster, &cooling_config);
 
     /* these node and endpoint handles can be used to create/add other endpoints and clusters. */
     if (!node || !endpoint) {
@@ -267,7 +353,10 @@ extern "C" void app_main()
                                           .address = 0x6d82,
                                           .command = 0x40bf,
     };
-    ESP_ERROR_CHECK(rmt_transmit(tx_channel, nec_encoder, &scan_code, sizeof(scan_code), &transmit_config));
+     //ESP_ERROR_CHECK(rmt_transmit_sharpac(2600, MATTER_AC_TYPE_COOLING));
+     //ESP_ERROR_CHECK(rmt_transmit_sharpac(2600, MATTER_AC_TYPE_POWER_OFF));
+
+     //ESP_ERROR_CHECK(rmt_transmit(tx_channel, nec_encoder, &scan_code, sizeof(scan_code), &transmit_config));
     //ESP_ERROR_CHECK(rmt_transmit(rx_channel, ));
     // light onoff
     // .address = 0xd729
